@@ -603,11 +603,12 @@ func (n *network) Delete() error {
 	if err = n.getController().deleteFromStore(n.getEpCnt()); err != nil {
 		return fmt.Errorf("error deleting network endpoint count from store: %v", err)
 	}
+
+	n.ipamRelease()
+
 	if err = n.getController().deleteFromStore(n); err != nil {
 		return fmt.Errorf("error deleting network from store: %v", err)
 	}
-
-	n.ipamRelease()
 
 	return nil
 }
@@ -670,6 +671,12 @@ func (n *network) CreateEndpoint(name string, options ...EndpointOption) (Endpoi
 	n = ep.network
 
 	ep.processOptions(options...)
+
+	if opt, ok := ep.generic[netlabel.MacAddress]; ok {
+		if mac, ok := opt.(net.HardwareAddr); ok {
+			ep.iface.mac = mac
+		}
+	}
 
 	if err = ep.assignAddress(true, !n.postIPv6); err != nil {
 		return nil, err
