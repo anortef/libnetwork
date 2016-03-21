@@ -278,7 +278,7 @@ func handleSignals(controller libnetwork.NetworkController) {
 	signals := []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT}
 	signal.Notify(c, signals...)
 	go func() {
-		for _ = range c {
+		for range c {
 			controller.Stop()
 			os.Exit(0)
 		}
@@ -435,7 +435,7 @@ func ipamOption(bridgeName string) libnetwork.NetworkOption {
 		if hip.IsGlobalUnicast() {
 			ipamV4Conf.Gateway = nw.IP.String()
 		}
-		return libnetwork.NetworkOptionIpam("default", "", []*libnetwork.IpamConf{ipamV4Conf}, nil)
+		return libnetwork.NetworkOptionIpam("default", "", []*libnetwork.IpamConf{ipamV4Conf}, nil, nil)
 	}
 	return nil
 }

@@ -3,7 +3,6 @@ package libnetwork
 import (
 	"fmt"
 
-	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/types"
 )
 
@@ -11,6 +10,8 @@ const (
 	libnGWNetwork = "docker_gwbridge"
 	gwEPlen       = 12
 )
+
+var procGwNetwork = make(chan (bool), 1)
 
 /*
    libnetwork creates a bridge network "docker_gw_bridge" for provding
@@ -26,39 +27,25 @@ const (
    - its deleted when an endpoint with GW joins the container
 */
 
-func (sb *sandbox) setupDefaultGW(srcEp *endpoint) error {
-	var createOptions []EndpointOption
-	c := srcEp.getNetwork().getController()
+func (sb *sandbox) setupDefaultGW() error {
 
 	// check if the conitainer already has a GW endpoint
 	if ep := sb.getEndpointInGWNetwork(); ep != nil {
 		return nil
 	}
 
+	c := sb.controller
+
+	// Look for default gw network. In case of error (includes not found),
+	// retry and create it if needed in a serialized execution.
 	n, err := c.NetworkByName(libnGWNetwork)
 	if err != nil {
-		if _, ok := err.(types.NotFoundError); !ok {
-			return err
-		}
-		n, err = c.createGWNetwork()
-		if err != nil {
+		if n, err = c.defaultGwNetwork(); err != nil {
 			return err
 		}
 	}
 
-	if opt, ok := srcEp.generic[netlabel.PortMap]; ok {
-		if pb, ok := opt.([]types.PortBinding); ok {
-			createOptions = append(createOptions, CreateOptionPortMapping(pb))
-		}
-	}
-
-	if opt, ok := srcEp.generic[netlabel.ExposedPorts]; ok {
-		if exp, ok := opt.([]types.TransportPort); ok {
-			createOptions = append(createOptions, CreateOptionExposedPorts(exp))
-		}
-	}
-
-	createOptions = append(createOptions, CreateOptionAnonymous())
+	createOptions := []EndpointOption{CreateOptionAnonymous()}
 
 	eplen := gwEPlen
 	if len(sb.containerID) < gwEPlen {
@@ -74,9 +61,13 @@ func (sb *sandbox) setupDefaultGW(srcEp *endpoint) error {
 	if err := epLocal.sbJoin(sb); err != nil {
 		return fmt.Errorf("container %s: endpoint join on GW Network failed: %v", sb.containerID, err)
 	}
+
 	return nil
 }
 
+// If present, removes the endpoint connecting the sandbox to the default gw network.
+// Unless it is the endpoint designated to provide the external connectivity.
+// If the sandbox is being deleted, removes the endpoint unconditionally.
 func (sb *sandbox) clearDefaultGW() error {
 	var ep *endpoint
 
@@ -84,10 +75,14 @@ func (sb *sandbox) clearDefaultGW() error {
 		return nil
 	}
 
-	if err := ep.sbLeave(sb); err != nil {
+	if ep == sb.getGatewayEndpoint() && !sb.inDelete {
+		return nil
+	}
+
+	if err := ep.sbLeave(sb, false); err != nil {
 		return fmt.Errorf("container %s: endpoint leaving GW Network failed: %v", sb.containerID, err)
 	}
-	if err := ep.Delete(); err != nil {
+	if err := ep.Delete(false); err != nil {
 		return fmt.Errorf("container %s: deleting endpoint on GW Network failed: %v", sb.containerID, err)
 	}
 	return nil
@@ -98,7 +93,7 @@ func (sb *sandbox) needDefaultGW() bool {
 
 	for _, ep := range sb.getConnectedEndpoints() {
 		if ep.endpointInGWNetwork() {
-			continue
+			return false
 		}
 		if ep.getNetwork().Type() == "null" || ep.getNetwork().Type() == "host" {
 			continue
@@ -145,6 +140,34 @@ func (sb *sandbox) getEPwithoutGateway() *endpoint {
 			continue
 		}
 		if len(ep.Gateway()) == 0 {
+			return ep
+		}
+	}
+	return nil
+}
+
+// Looks for the default gw network and creates it if not there.
+// Parallel executions are serialized.
+func (c *controller) defaultGwNetwork() (Network, error) {
+	procGwNetwork <- true
+	defer func() { <-procGwNetwork }()
+
+	n, err := c.NetworkByName(libnGWNetwork)
+	if err != nil {
+		if _, ok := err.(types.NotFoundError); ok {
+			n, err = c.createGWNetwork()
+		}
+	}
+	return n, err
+}
+
+// Returns the endpoint which is providing external connectivity to the sandbox
+func (sb *sandbox) getGatewayEndpoint() *endpoint {
+	for _, ep := range sb.getConnectedEndpoints() {
+		if ep.getNetwork().Type() == "null" || ep.getNetwork().Type() == "host" {
+			continue
+		}
+		if len(ep.Gateway()) != 0 {
 			return ep
 		}
 	}

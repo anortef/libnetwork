@@ -6,7 +6,9 @@ import (
 	"os/exec"
 	"regexp"
 	"sync"
+	"syscall"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/types"
 	"github.com/vishvananda/netlink"
 )
@@ -19,6 +21,7 @@ type nwIface struct {
 	dstName     string
 	master      string
 	dstMaster   string
+	mac         net.HardwareAddr
 	address     *net.IPNet
 	addressIPv6 *net.IPNet
 	routes      []*net.IPNet
@@ -60,6 +63,13 @@ func (i *nwIface) Master() string {
 	defer i.Unlock()
 
 	return i.master
+}
+
+func (i *nwIface) MacAddress() net.HardwareAddr {
+	i.Lock()
+	defer i.Unlock()
+
+	return types.GetMacCopy(i.mac)
 }
 
 func (i *nwIface) Address() *net.IPNet {
@@ -126,7 +136,7 @@ func (i *nwIface) Remove() error {
 
 		err = netlink.LinkSetName(iface, i.SrcName())
 		if err != nil {
-			fmt.Println("LinkSetName failed: ", err)
+			log.Debugf("LinkSetName failed for interface %s: %v", i.SrcName(), err)
 			return err
 		}
 
@@ -138,7 +148,7 @@ func (i *nwIface) Remove() error {
 		} else if !isDefault {
 			// Move the network interface to caller namespace.
 			if err := netlink.LinkSetNsFd(iface, callerFD); err != nil {
-				fmt.Println("LinkSetNsPid failed: ", err)
+				log.Debugf("LinkSetNsPid failed for interface %s: %v", i.SrcName(), err)
 				return err
 			}
 		}
@@ -302,8 +312,9 @@ func configureInterface(iface netlink.Link, i *nwIface) error {
 		ErrMessage string
 	}{
 		{setInterfaceName, fmt.Sprintf("error renaming interface %q to %q", ifaceName, i.DstName())},
-		{setInterfaceIP, fmt.Sprintf("error setting interface %q IP to %q", ifaceName, i.Address())},
-		{setInterfaceIPv6, fmt.Sprintf("error setting interface %q IPv6 to %q", ifaceName, i.AddressIPv6())},
+		{setInterfaceMAC, fmt.Sprintf("error setting interface %q MAC to %q", ifaceName, i.MacAddress())},
+		{setInterfaceIP, fmt.Sprintf("error setting interface %q IP to %v", ifaceName, i.Address())},
+		{setInterfaceIPv6, fmt.Sprintf("error setting interface %q IPv6 to %v", ifaceName, i.AddressIPv6())},
 		{setInterfaceMaster, fmt.Sprintf("error setting interface %q master to %q", ifaceName, i.DstMaster())},
 	}
 
@@ -324,6 +335,13 @@ func setInterfaceMaster(iface netlink.Link, i *nwIface) error {
 		LinkAttrs: netlink.LinkAttrs{Name: i.DstMaster()}})
 }
 
+func setInterfaceMAC(iface netlink.Link, i *nwIface) error {
+	if i.MacAddress() == nil {
+		return nil
+	}
+	return netlink.LinkSetHardwareAddr(iface, i.MacAddress())
+}
+
 func setInterfaceIP(iface netlink.Link, i *nwIface) error {
 	if i.Address() == nil {
 		return nil
@@ -337,7 +355,7 @@ func setInterfaceIPv6(iface netlink.Link, i *nwIface) error {
 	if i.AddressIPv6() == nil {
 		return nil
 	}
-	ipAddr := &netlink.Addr{IPNet: i.AddressIPv6(), Label: ""}
+	ipAddr := &netlink.Addr{IPNet: i.AddressIPv6(), Label: "", Flags: syscall.IFA_F_NODAD}
 	return netlink.AddrAdd(iface, ipAddr)
 }
 

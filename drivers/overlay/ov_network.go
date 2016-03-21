@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -61,6 +63,9 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, ipV4Dat
 	if id == "" {
 		return fmt.Errorf("invalid network id")
 	}
+	if len(ipV4Data) == 0 || ipV4Data[0].Pool.String() == "0.0.0.0/0" {
+		return types.BadRequestErrorf("ipv4 pool is empty")
+	}
 
 	// Since we perform lazy configuration make sure we try
 	// configuring the driver when we enter CreateNetwork
@@ -107,6 +112,14 @@ func (d *driver) DeleteNetwork(nid string) error {
 	d.deleteNetwork(nid)
 
 	return n.releaseVxlanID()
+}
+
+func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
+	return nil
+}
+
+func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
+	return nil
 }
 
 func (n *network) incEndpointCount() {
@@ -158,7 +171,9 @@ func (n *network) destroySandbox() {
 	sbox := n.sandbox()
 	if sbox != nil {
 		for _, iface := range sbox.Info().Interfaces() {
-			iface.Remove()
+			if err := iface.Remove(); err != nil {
+				logrus.Debugf("Remove interface %s failed: %v", iface.SrcName(), err)
+			}
 		}
 
 		for _, s := range n.subnets {
@@ -298,6 +313,26 @@ func (n *network) initSubnetSandbox(s *subnet) error {
 	return nil
 }
 
+func (n *network) cleanupStaleSandboxes() {
+	filepath.Walk(filepath.Dir(osl.GenerateKey("walk")),
+		func(path string, info os.FileInfo, err error) error {
+			_, fname := filepath.Split(path)
+
+			pList := strings.Split(fname, "-")
+			if len(pList) <= 1 {
+				return nil
+			}
+
+			pattern := pList[1]
+			if strings.Contains(n.id, pattern) {
+				syscall.Unmount(path, syscall.MNT_DETACH)
+				os.Remove(path)
+			}
+
+			return nil
+		})
+}
+
 func (n *network) initSandbox() error {
 	n.Lock()
 	n.initEpoch++
@@ -310,6 +345,10 @@ func (n *network) initSandbox() error {
 			return err
 		}
 	}
+
+	// If there are any stale sandboxes related to this network
+	// from previous daemon life clean it up here
+	n.cleanupStaleSandboxes()
 
 	sbox, err := osl.NewSandbox(
 		osl.GenerateKey(fmt.Sprintf("%d-", n.initEpoch)+n.id), !hostMode)

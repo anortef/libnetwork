@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/docker/libnetwork/datastore"
+	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
 	"github.com/docker/libnetwork/ipamapi"
 	"github.com/docker/libnetwork/netlabel"
@@ -43,7 +44,7 @@ func TestIpamDriverRegistration(t *testing.T) {
 
 	err = c.(*controller).RegisterIpamDriver("", nil)
 	if err == nil {
-		t.Fatalf("Expected failure, but suceeded")
+		t.Fatalf("Expected failure, but succeeded")
 	}
 	if _, ok := err.(types.BadRequestError); !ok {
 		t.Fatalf("Failed for unexpected reason: %v", err)
@@ -51,7 +52,7 @@ func TestIpamDriverRegistration(t *testing.T) {
 
 	err = c.(*controller).RegisterIpamDriver(ipamapi.DefaultIPAM, nil)
 	if err == nil {
-		t.Fatalf("Expected failure, but suceeded")
+		t.Fatalf("Expected failure, but succeeded")
 	}
 	if _, ok := err.(types.ForbiddenError); !ok {
 		t.Fatalf("Failed for unexpected reason: %v", err)
@@ -67,25 +68,24 @@ func TestNetworkMarshalling(t *testing.T) {
 		networkType: "bridge",
 		enableIPv6:  true,
 		persist:     true,
+		ipamOptions: map[string]string{
+			netlabel.MacAddress: "a:b:c:d:e:f",
+		},
 		ipamV4Config: []*IpamConf{
-			&IpamConf{
+			{
 				PreferredPool: "10.2.0.0/16",
 				SubPool:       "10.2.0.0/24",
-				Options: map[string]string{
-					netlabel.MacAddress: "a:b:c:d:e:f",
-				},
-				Gateway:      "",
-				AuxAddresses: nil,
+				Gateway:       "",
+				AuxAddresses:  nil,
 			},
-			&IpamConf{
+			{
 				PreferredPool: "10.2.0.0/16",
 				SubPool:       "10.2.1.0/24",
-				Options:       nil,
 				Gateway:       "10.2.1.254",
 			},
 		},
 		ipamV6Config: []*IpamConf{
-			&IpamConf{
+			{
 				PreferredPool: "abcd::/64",
 				SubPool:       "abcd:abcd:abcd:abcd:abcd::/80",
 				Gateway:       "abcd::29/64",
@@ -93,7 +93,7 @@ func TestNetworkMarshalling(t *testing.T) {
 			},
 		},
 		ipamV4Info: []*IpamInfo{
-			&IpamInfo{
+			{
 				PoolID: "ipoolverde123",
 				Meta: map[string]string{
 					netlabel.Gateway: "10.2.1.255/16",
@@ -108,7 +108,7 @@ func TestNetworkMarshalling(t *testing.T) {
 					AuxAddresses: nil,
 				},
 			},
-			&IpamInfo{
+			{
 				PoolID: "ipoolblue345",
 				Meta: map[string]string{
 					netlabel.Gateway: "10.2.1.255/16",
@@ -121,12 +121,12 @@ func TestNetworkMarshalling(t *testing.T) {
 					},
 					Gateway: &net.IPNet{IP: net.IP{10, 2, 1, 254}, Mask: net.IPMask{255, 255, 255, 0}},
 					AuxAddresses: map[string]*net.IPNet{
-						"ip3": &net.IPNet{IP: net.IP{10, 2, 1, 3}, Mask: net.IPMask{255, 255, 255, 0}},
-						"ip5": &net.IPNet{IP: net.IP{10, 2, 1, 55}, Mask: net.IPMask{255, 255, 255, 0}},
+						"ip3": {IP: net.IP{10, 2, 1, 3}, Mask: net.IPMask{255, 255, 255, 0}},
+						"ip5": {IP: net.IP{10, 2, 1, 55}, Mask: net.IPMask{255, 255, 255, 0}},
 					},
 				},
 			},
-			&IpamInfo{
+			{
 				PoolID: "weirdinfo",
 				IPAMData: driverapi.IPAMData{
 					Gateway: &net.IPNet{
@@ -137,7 +137,7 @@ func TestNetworkMarshalling(t *testing.T) {
 			},
 		},
 		ipamV6Info: []*IpamInfo{
-			&IpamInfo{
+			{
 				PoolID: "ipoolv6",
 				IPAMData: driverapi.IPAMData{
 					AddressSpace: "viola",
@@ -203,7 +203,7 @@ func printIpamInfo(list []*IpamInfo) string {
 }
 
 func TestEndpointMarshalling(t *testing.T) {
-	ip, nw6, err := net.ParseCIDR("2001:3002:4003::122/64")
+	ip, nw6, err := net.ParseCIDR("2001:db8:4003::122/64")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,6 @@ func compareIpamConfList(listA, listB []*IpamConf) bool {
 		b = listB[i]
 		if a.PreferredPool != b.PreferredPool ||
 			a.SubPool != b.SubPool ||
-			!compareStringMaps(a.Options, b.Options) ||
 			a.Gateway != b.Gateway || !compareStringMaps(a.AuxAddresses, b.AuxAddresses) {
 			return false
 		}
@@ -344,7 +343,7 @@ func TestAuxAddresses(t *testing.T) {
 
 	for _, i := range input {
 
-		n.ipamV4Config = []*IpamConf{&IpamConf{PreferredPool: i.masterPool, SubPool: i.subPool, AuxAddresses: i.auxAddresses}}
+		n.ipamV4Config = []*IpamConf{{PreferredPool: i.masterPool, SubPool: i.subPool, AuxAddresses: i.auxAddresses}}
 
 		err = n.ipamAllocate()
 
@@ -374,7 +373,7 @@ func TestIpamReleaseOnNetDriverFailures(t *testing.T) {
 
 	// Test whether ipam state release is invoked  on network create failure from net driver
 	// by checking whether subsequent network creation requesting same gateway IP succeeds
-	ipamOpt := NetworkOptionIpam(ipamapi.DefaultIPAM, "", []*IpamConf{&IpamConf{PreferredPool: "10.34.0.0/16", Gateway: "10.34.255.254"}}, nil)
+	ipamOpt := NetworkOptionIpam(ipamapi.DefaultIPAM, "", []*IpamConf{{PreferredPool: "10.34.0.0/16", Gateway: "10.34.255.254"}}, nil, nil)
 	if _, err := c.NewNetwork(badDriverName, "badnet1", ipamOpt); err == nil {
 		t.Fatalf("bad network driver should have failed network creation")
 	}
@@ -398,7 +397,7 @@ func TestIpamReleaseOnNetDriverFailures(t *testing.T) {
 	}
 
 	// Now create good bridge network with different gateway
-	ipamOpt2 := NetworkOptionIpam(ipamapi.DefaultIPAM, "", []*IpamConf{&IpamConf{PreferredPool: "10.34.0.0/16", Gateway: "10.34.255.253"}}, nil)
+	ipamOpt2 := NetworkOptionIpam(ipamapi.DefaultIPAM, "", []*IpamConf{{PreferredPool: "10.34.0.0/16", Gateway: "10.34.255.253"}}, nil, nil)
 	gnw, err = c.NewNetwork("bridge", "goodnet2", ipamOpt2)
 	if err != nil {
 		t.Fatal(err)
@@ -409,7 +408,7 @@ func TestIpamReleaseOnNetDriverFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ep.Delete()
+	defer ep.Delete(false)
 
 	expectedIP, _ := types.ParseCIDR("10.34.0.1/16")
 	if !types.CompareIPNet(ep.Info().Iface().Address(), expectedIP) {
@@ -447,12 +446,18 @@ func (b *badDriver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinIn
 func (b *badDriver) Leave(nid, eid string) error {
 	return nil
 }
-func (b *badDriver) DiscoverNew(dType driverapi.DiscoveryType, data interface{}) error {
+func (b *badDriver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) error {
 	return nil
 }
-func (b *badDriver) DiscoverDelete(dType driverapi.DiscoveryType, data interface{}) error {
+func (b *badDriver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{}) error {
 	return nil
 }
 func (b *badDriver) Type() string {
 	return badDriverName
+}
+func (b *badDriver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
+	return nil
+}
+func (b *badDriver) RevokeExternalConnectivity(nid, eid string) error {
+	return nil
 }

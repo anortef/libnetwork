@@ -6,7 +6,6 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/iptables"
-	"github.com/docker/libnetwork/netutils"
 )
 
 // DockerChain: DOCKER iptable chain name
@@ -60,6 +59,8 @@ func setupIPChains(config *configuration) (*iptables.ChainInfo, *iptables.ChainI
 }
 
 func (n *bridgeNetwork) setupIPTables(config *networkConfiguration, i *bridgeInterface) error {
+	var err error
+
 	d := n.driver
 	d.Lock()
 	driverConfig := d.config
@@ -73,46 +74,49 @@ func (n *bridgeNetwork) setupIPTables(config *networkConfiguration, i *bridgeInt
 	// Pickup this configuraton option from driver
 	hairpinMode := !driverConfig.EnableUserlandProxy
 
-	addrv4, _, err := netutils.GetIfaceAddr(config.BridgeName)
-	if err != nil {
-		return fmt.Errorf("Failed to setup IP tables, cannot acquire Interface address: %s", err.Error())
-	}
-	ipnet := addrv4.(*net.IPNet)
 	maskedAddrv4 := &net.IPNet{
-		IP:   ipnet.IP.Mask(ipnet.Mask),
-		Mask: ipnet.Mask,
+		IP:   i.bridgeIPv4.IP.Mask(i.bridgeIPv4.Mask),
+		Mask: i.bridgeIPv4.Mask,
 	}
-	if err = setupIPTablesInternal(config.BridgeName, maskedAddrv4, config.EnableICC, config.EnableIPMasquerade, hairpinMode, true); err != nil {
-		return fmt.Errorf("Failed to Setup IP tables: %s", err.Error())
-	}
-	n.registerIptCleanFunc(func() error {
-		return setupIPTablesInternal(config.BridgeName, maskedAddrv4, config.EnableICC, config.EnableIPMasquerade, hairpinMode, false)
-	})
+	if config.Internal {
+		if err = setupInternalNetworkRules(config.BridgeName, maskedAddrv4, true); err != nil {
+			return fmt.Errorf("Failed to Setup IP tables: %s", err.Error())
+		}
+		n.registerIptCleanFunc(func() error {
+			return setupInternalNetworkRules(config.BridgeName, maskedAddrv4, false)
+		})
+	} else {
+		if err = setupIPTablesInternal(config.BridgeName, maskedAddrv4, config.EnableICC, config.EnableIPMasquerade, hairpinMode, true); err != nil {
+			return fmt.Errorf("Failed to Setup IP tables: %s", err.Error())
+		}
+		n.registerIptCleanFunc(func() error {
+			return setupIPTablesInternal(config.BridgeName, maskedAddrv4, config.EnableICC, config.EnableIPMasquerade, hairpinMode, false)
+		})
+		natChain, filterChain, _, err := n.getDriverChains()
+		if err != nil {
+			return fmt.Errorf("Failed to setup IP tables, cannot acquire chain info %s", err.Error())
+		}
 
-	natChain, filterChain, _, err := n.getDriverChains()
-	if err != nil {
-		return fmt.Errorf("Failed to setup IP tables, cannot acquire chain info %s", err.Error())
-	}
+		err = iptables.ProgramChain(natChain, config.BridgeName, hairpinMode, true)
+		if err != nil {
+			return fmt.Errorf("Failed to program NAT chain: %s", err.Error())
+		}
 
-	err = iptables.ProgramChain(natChain, config.BridgeName, hairpinMode, true)
-	if err != nil {
-		return fmt.Errorf("Failed to program NAT chain: %s", err.Error())
-	}
+		err = iptables.ProgramChain(filterChain, config.BridgeName, hairpinMode, true)
+		if err != nil {
+			return fmt.Errorf("Failed to program FILTER chain: %s", err.Error())
+		}
 
-	err = iptables.ProgramChain(filterChain, config.BridgeName, hairpinMode, true)
-	if err != nil {
-		return fmt.Errorf("Failed to program FILTER chain: %s", err.Error())
+		n.registerIptCleanFunc(func() error {
+			return iptables.ProgramChain(filterChain, config.BridgeName, hairpinMode, false)
+		})
+
+		n.portMapper.SetIptablesChain(natChain, n.getNetworkBridgeName())
 	}
 
 	if err := ensureJumpRule("FORWARD", IsolationChain); err != nil {
 		return err
 	}
-
-	n.registerIptCleanFunc(func() error {
-		return iptables.ProgramChain(filterChain, config.BridgeName, hairpinMode, false)
-	})
-
-	n.portMapper.SetIptablesChain(filterChain, n.getNetworkBridgeName())
 
 	return nil
 }
@@ -130,6 +134,7 @@ func setupIPTablesInternal(bridgeIface string, addr net.Addr, icc, ipmasq, hairp
 		address   = addr.String()
 		natRule   = iptRule{table: iptables.Nat, chain: "POSTROUTING", preArgs: []string{"-t", "nat"}, args: []string{"-s", address, "!", "-o", bridgeIface, "-j", "MASQUERADE"}}
 		hpNatRule = iptRule{table: iptables.Nat, chain: "POSTROUTING", preArgs: []string{"-t", "nat"}, args: []string{"-m", "addrtype", "--src-type", "LOCAL", "-o", bridgeIface, "-j", "MASQUERADE"}}
+		skipDNAT  = iptRule{table: iptables.Nat, chain: DockerChain, preArgs: []string{"-t", "nat"}, args: []string{"-i", bridgeIface, "-j", "RETURN"}}
 		outRule   = iptRule{table: iptables.Filter, chain: "FORWARD", args: []string{"-i", bridgeIface, "!", "-o", bridgeIface, "-j", "ACCEPT"}}
 		inRule    = iptRule{table: iptables.Filter, chain: "FORWARD", args: []string{"-o", bridgeIface, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"}}
 	)
@@ -137,6 +142,12 @@ func setupIPTablesInternal(bridgeIface string, addr net.Addr, icc, ipmasq, hairp
 	// Set NAT.
 	if ipmasq {
 		if err := programChainRule(natRule, "NAT", enable); err != nil {
+			return err
+		}
+	}
+
+	if ipmasq && !hairpin {
+		if err := programChainRule(skipDNAT, "SKIP DNAT", enable); err != nil {
 			return err
 		}
 	}
@@ -307,5 +318,31 @@ func ensureJumpRule(fromChain, toChain string) error {
 		return fmt.Errorf("unable to insert jump to %s rule in %s chain: %s", toChain, fromChain, err.Error())
 	}
 
+	return nil
+}
+
+func removeIPChains() {
+	for _, chainInfo := range []iptables.ChainInfo{
+		{Name: DockerChain, Table: iptables.Nat},
+		{Name: DockerChain, Table: iptables.Filter},
+		{Name: IsolationChain, Table: iptables.Filter},
+	} {
+		if err := chainInfo.Remove(); err != nil {
+			logrus.Warnf("Failed to remove existing iptables entries in table %s chain %s : %v", chainInfo.Table, chainInfo.Name, err)
+		}
+	}
+}
+
+func setupInternalNetworkRules(bridgeIface string, addr net.Addr, insert bool) error {
+	var (
+		inDropRule  = iptRule{table: iptables.Filter, chain: IsolationChain, args: []string{"-i", bridgeIface, "!", "-d", addr.String(), "-j", "DROP"}}
+		outDropRule = iptRule{table: iptables.Filter, chain: IsolationChain, args: []string{"-o", bridgeIface, "!", "-s", addr.String(), "-j", "DROP"}}
+	)
+	if err := programChainRule(inDropRule, "DROP INCOMING", insert); err != nil {
+		return err
+	}
+	if err := programChainRule(outDropRule, "DROP OUTGOING", insert); err != nil {
+		return err
+	}
 	return nil
 }

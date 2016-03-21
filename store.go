@@ -14,6 +14,7 @@ func (c *controller) initStores() error {
 		return nil
 	}
 	scopeConfigs := c.cfg.Scopes
+	c.stores = nil
 	c.Unlock()
 
 	for scope, scfg := range scopeConfigs {
@@ -70,11 +71,12 @@ func (c *controller) getNetworkFromStore(nid string) (*network, error) {
 
 		ec := &endpointCnt{n: n}
 		err = store.GetObject(datastore.Key(ec.Key()...), ec)
-		if err != nil {
+		if err != nil && !n.inDelete {
 			return nil, fmt.Errorf("could not find endpoint count for network %s: %v", n.Name(), err)
 		}
 
 		n.epCnt = ec
+		n.scope = store.Scope()
 		return n, nil
 	}
 
@@ -102,11 +104,13 @@ func (c *controller) getNetworksForScope(scope string) ([]*network, error) {
 
 		ec := &endpointCnt{n: n}
 		err = store.GetObject(datastore.Key(ec.Key()...), ec)
-		if err != nil {
-			return nil, fmt.Errorf("could not find endpoint count key %s for network %s while listing: %v", datastore.Key(ec.Key()...), n.Name(), err)
+		if err != nil && !n.inDelete {
+			log.Warnf("Could not find endpoint count key %s for network %s while listing: %v", datastore.Key(ec.Key()...), n.Name(), err)
+			continue
 		}
 
 		n.epCnt = ec
+		n.scope = scope
 		nl = append(nl, n)
 	}
 
@@ -129,15 +133,21 @@ func (c *controller) getNetworksFromStore() ([]*network, error) {
 
 		for _, kvo := range kvol {
 			n := kvo.(*network)
+			n.Lock()
 			n.ctrlr = c
+			n.Unlock()
 
 			ec := &endpointCnt{n: n}
 			err = store.GetObject(datastore.Key(ec.Key()...), ec)
-			if err != nil {
-				return nil, fmt.Errorf("could not find endpoint count key %s for network %s while listing: %v", datastore.Key(ec.Key()...), n.Name(), err)
+			if err != nil && !n.inDelete {
+				log.Warnf("could not find endpoint count key %s for network %s while listing: %v", datastore.Key(ec.Key()...), n.Name(), err)
+				continue
 			}
 
+			n.Lock()
 			n.epCnt = ec
+			n.scope = store.Scope()
+			n.Unlock()
 			nl = append(nl, n)
 		}
 	}
@@ -146,17 +156,21 @@ func (c *controller) getNetworksFromStore() ([]*network, error) {
 }
 
 func (n *network) getEndpointFromStore(eid string) (*endpoint, error) {
-	store := n.ctrlr.getStore(n.Scope())
-	if store == nil {
-		return nil, fmt.Errorf("could not find endpoint %s: datastore not found for scope %s", eid, n.Scope())
+	var errors []string
+	for _, store := range n.ctrlr.getStores() {
+		ep := &endpoint{id: eid, network: n}
+		err := store.GetObject(datastore.Key(ep.Key()...), ep)
+		// Continue searching in the next store if the key is not found in this store
+		if err != nil {
+			if err != datastore.ErrKeyNotFound {
+				errors = append(errors, fmt.Sprintf("{%s:%v}, ", store.Scope(), err))
+				log.Debugf("could not find endpoint %s in %s: %v", eid, store.Scope(), err)
+			}
+			continue
+		}
+		return ep, nil
 	}
-
-	ep := &endpoint{id: eid, network: n}
-	err := store.GetObject(datastore.Key(ep.Key()...), ep)
-	if err != nil {
-		return nil, fmt.Errorf("could not find endpoint %s: %v", eid, err)
-	}
-	return ep, nil
+	return nil, fmt.Errorf("could not find endpoint %s: %v", eid, errors)
 }
 
 func (n *network) getEndpointsFromStore() ([]*endpoint, error) {
@@ -405,9 +419,29 @@ func (c *controller) watchLoop() {
 }
 
 func (c *controller) startWatch() {
+	if c.watchCh != nil {
+		return
+	}
 	c.watchCh = make(chan *endpoint)
 	c.unWatchCh = make(chan *endpoint)
 	c.nmap = make(map[string]*netWatch)
 
 	go c.watchLoop()
+}
+
+func (c *controller) networkCleanup() {
+	networks, err := c.getNetworksFromStore()
+	if err != nil {
+		log.Warnf("Could not retrieve networks from store(s) during network cleanup: %v", err)
+		return
+	}
+
+	for _, n := range networks {
+		if n.inDelete {
+			log.Infof("Removing stale network %s (%s)", n.Name(), n.ID())
+			if err := n.delete(true); err != nil {
+				log.Debugf("Error while removing stale network: %v", err)
+			}
+		}
+	}
 }
